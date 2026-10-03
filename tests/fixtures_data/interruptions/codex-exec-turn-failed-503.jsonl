@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a0f3c6-d1e7-7a52-9a5e-1f2c3b4d5e62"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/bash -lc 'uv run pytest -q tests/unit/test_ledger.py'","aggregated_output":"4 passed in 0.31s\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"error","message":"Reconnecting... 1/5 (unexpected status 503 Service Unavailable: <html><head><title>503 Service Temporarily Unavailable</title></head></html>)"}}
+{"type":"error","message":"exceeded retry limit, last status: 503 Service Unavailable"}
+{"type":"turn.failed","error":{"message":"exceeded retry limit, last status: 503 Service Unavailable"}}

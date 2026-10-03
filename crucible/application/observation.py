@@ -18,7 +18,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from crucible.application.publish import external_review_trigger, open_review_cycle
+from crucible.application.decisions import open_escalation
+from crucible.application.publish import (
+    external_review_trigger,
+    open_review_cycle,
+    reopen_or_cancel,
+)
 from crucible.application.transitions import move_task, record_event
 from crucible.application.wakes import create_wake
 from crucible.contracts.wake import WakeReason
@@ -102,6 +107,11 @@ OBSERVED_STATES: frozenset[TaskState] = frozenset(
 # hades #360: the PR of a task in any of these is polled, a correction's included, so a
 # merge made while the correction runs is seen. Only an open PR is polled at all.
 POLLED_STATES: frozenset[TaskState] = OBSERVED_STATES | CORRECTION_STATES
+# hades #379: the correction states a first publication passes through too. In these a
+# correction is under way only when an earlier publication of the task completed.
+PUBLICATION_STATES: frozenset[TaskState] = frozenset(
+    {TaskState.PUBLISHING, TaskState.PUBLISH_FAILED}
+)
 # The states a head change moves to `head_diverged` from (09).
 DIVERGENCE_STATES: frozenset[TaskState] = frozenset(
     {
@@ -135,6 +145,21 @@ class ObservationResult:
 def policy_for(uow: UnitOfWork, task: Task) -> dict[str, Any]:
     stored = uow.policies.get(task.policy_name, task.policy_version)
     return stored.document if stored else {}
+
+
+def correction_in_flight(uow: UnitOfWork, task: Task) -> bool:
+    """A correction is under way against the task's pull request (hades #360, #379).
+
+    Every correction state but publishing and publish_failed is reached with a pull
+    request only by a correction. Those two are also a first publication's, which can
+    fail after it opened the pull request; that one is polled and settled as any
+    published task is, and only a task an earlier publication completed for is
+    correcting there."""
+    if task.state not in CORRECTION_STATES:
+        return False
+    if task.state not in PUBLICATION_STATES:
+        return True
+    return uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_COMPLETED.value) is not None
 
 
 def accepted_head(uow: UnitOfWork, task: Task) -> str:
@@ -1043,10 +1068,15 @@ def observe_state(
                 "state": "merged",
                 "merge_sha": pull_request.merge_sha,
                 "merged_by": pull_request.merged_by,
+                # hades #379: the head GitHub merged, compared with the last head
+                # Crucible pushed when a correction was under way.
+                "head_sha": ref.head_sha,
             },
         )
         result.changed = True
-        settle_pull_request_state(uow, clock, task=task, pull_request=pull_request)
+        settle_pull_request_state(
+            uow, clock, task=task, pull_request=pull_request, merged_head=ref.head_sha
+        )
         return
     if ref.state == "closed" and not ref.merged and pull_request.state is PullRequestState.OPEN:
         pull_request.state = PullRequestState.CLOSED
@@ -1069,8 +1099,53 @@ def observe_state(
         settle_pull_request_state(uow, clock, task=task, pull_request=pull_request)
 
 
+def pushed_heads(
+    uow: UnitOfWork, task: Task, pull_request: PullRequest
+) -> tuple[dict[str, bool], str | None]:
+    """Heads Crucible confirmed on the work branch and the latest recorded one.
+
+    The heads recorded on the PR as pushed by Crucible, which include the PR's first
+    head from before branch_pushed records, and every branch_pushed head. Never the PR
+    row's current head: a poll sets that to a head someone else pushed (hades #379).
+    The bool records whether a head was only pushed as a quota checkpoint.
+    """
+    heads: dict[str, bool] = {}
+    latest: str | None = None
+    for row in uow.pull_request_heads.list_for_pull_request(pull_request.id):
+        if row.pushed_by is PushedBy.CRUCIBLE and row.sha:
+            heads[row.sha] = False
+            latest = row.sha
+    after = 0
+    while True:
+        events = uow.events.list_for_task(task.id, after_seq=after, limit=1000)
+        if not events:
+            break
+        for event in events:
+            if event.kind != EventKind.BRANCH_PUSHED.value:
+                continue
+            head = str(event.payload.get("head_sha") or "")
+            if head:
+                heads[head] = bool(event.payload.get("checkpoint"))
+                latest = head
+        after = int(events[-1].seq or after)
+    return heads, latest
+
+
+def recorded_merged_head(uow: UnitOfWork, task: Task) -> str | None:
+    """The head GitHub reported merged, as the merge was recorded (hades #379)."""
+    changed = uow.events.latest_for_task_kind(task.id, EventKind.PULL_REQUEST_STATE_CHANGED.value)
+    if changed is None or changed.payload.get("state") != "merged":
+        return None
+    return str(changed.payload.get("head_sha") or "") or None
+
+
 def settle_pull_request_state(
-    uow: UnitOfWork, clock: Clock, *, task: Task, pull_request: PullRequest
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    task: Task,
+    pull_request: PullRequest,
+    merged_head: str | None = None,
 ) -> bool:
     """Move a task whose pull request is merged or closed, and wake Foundry (23).
 
@@ -1081,38 +1156,122 @@ def settle_pull_request_state(
 
     hades #360: a merge also moves a task whose correction is under way against the
     PR. A close does not: the correction publishes to the PR again, and what to do with
-    a closed one is decided there."""
-    correcting = task.state in CORRECTION_STATES
+    a closed one is decided there.
+
+    hades #379: when a correction was under way, the head GitHub merged (`merged_head`,
+    or the one recorded with the merge) is compared with every head Crucible pushed and
+    confirmed on the remote. When it is one of them, it becomes the task's head; when it
+    is not, the task keeps the last head Crucible pushed, never a collected head that went
+    nowhere. The wake says which; an escalation is opened instead of the plain wake when
+    the merged head is not a pushed head, when it was only a quota checkpoint, or when
+    Crucible pushed a later head after it (a push that landed after the merge). A merge
+    recorded before #379 carries no head; the last pushed head is taken for it. A merge
+    seen while a first publication is publishing or failed moves the task as an early
+    merge does. A close seen in a correction state is woken about and leaves the task
+    where it is, except in publishing, where the publication reports it."""
+    correcting = correction_in_flight(uow, task)
+    if task.state in CORRECTION_STATES and pull_request.state is PullRequestState.CLOSED:
+        _wake_closed_during_correction(uow, clock, task=task, pull_request=pull_request)
+        return False
     if task.state not in OBSERVED_STATES and not (
-        correcting and pull_request.state is PullRequestState.MERGED
+        task.state in CORRECTION_STATES and pull_request.state is PullRequestState.MERGED
     ):
         return False
     now = clock.now()
     if pull_request.state is PullRequestState.MERGED:
         merged_from = task.state.value
         early = task.state is not TaskState.READY_FOR_MERGE
-        move_task(
-            uow,
-            clock,
-            task,
-            TaskState.MERGED,
-            EventKind.TASK_MERGED,
-            payload={
-                "pull_request": pull_request.number,
-                "merge_sha": pull_request.merge_sha,
-                "merged_by": pull_request.merged_by,
-                "merged_at": (pull_request.merged_at or now).isoformat(),
-                "merged_from": merged_from,
-            },
-        )
+        payload: dict[str, Any] = {
+            "pull_request": pull_request.number,
+            "merge_sha": pull_request.merge_sha,
+            "merged_by": pull_request.merged_by,
+            "merged_at": (pull_request.merged_at or now).isoformat(),
+            "merged_from": merged_from,
+        }
+        head_check = ""
+        head_matches = True
+        checkpoint = False
+        later_push: str | None = None
+        if correcting:
+            heads, pushed = pushed_heads(uow, task, pull_request)
+            merged = merged_head or recorded_merged_head(uow, task)
+            # A merge recorded before #379 carries no head: GitHub merged what was on
+            # the branch then, and that is the last head Crucible pushed.
+            head_matches = merged is None or merged in heads
+            matched_head = merged or pushed
+            checkpoint = bool(matched_head and heads.get(matched_head, False))
+            if head_matches and merged is not None and pushed and pushed != merged:
+                # Crucible pushed `pushed` after the head GitHub merged: the push landed
+                # on the branch after the merge, whichever record of it came first.
+                later_push = pushed
+            payload.update(
+                {
+                    "merged_head": merged,
+                    "merged_head_recorded": merged is not None,
+                    "last_pushed_head": pushed,
+                    "last_push_was_checkpoint": checkpoint,
+                    "merged_head_matches": head_matches,
+                    "pushed_after_merge": later_push,
+                }
+            )
+            # The merged task's head is a head Crucible pushed, not a corrected head that
+            # was collected and never pushed, nor a head someone else merged.
+            if head_matches:
+                task.head_sha = matched_head
+            elif pushed:
+                task.head_sha = pushed
+            if merged is None:
+                head_check = (
+                    f"; the merge was recorded without its head, so the merged head is "
+                    f"taken to be {pushed}, the last head Crucible pushed"
+                )
+            elif head_matches:
+                head_check = f"; the merged head {merged} is a head Crucible pushed"
+            else:
+                head_check = f"; the merged head {merged} is not among the heads Crucible pushed"
+            if head_matches and checkpoint:
+                head_check += (
+                    ", and that push was a quota checkpoint of an unfinished attempt, "
+                    "which passed no gate and was never accepted"
+                )
+            if later_push is not None:
+                head_check += (
+                    f"; head {later_push} was pushed after the merge and is not the merged head"
+                )
+        move_task(uow, clock, task, TaskState.MERGED, EventKind.TASK_MERGED, payload=payload)
         summary = (
             f"pull request #{pull_request.number} was merged by "
             f"{pull_request.merged_by or 'someone'} as {pull_request.merge_sha}"
         )
         if correcting:
             summary += f" while a correction was under way (the task was {merged_from})"
+            summary += head_check
         elif early:
             summary += f", before Crucible saw it ready for merge (the task was {merged_from})"
+        if not head_matches or checkpoint or later_push is not None:
+            if not head_matches:
+                problem = "What was merged is not a head Crucible pushed"
+                decide = "decide whether the merge stands"
+            elif checkpoint:
+                problem = "What was merged is an ungated quota checkpoint"
+                decide = "decide whether the merge stands"
+            else:
+                # The same escalation as a push refused after a recorded merge.
+                problem = (
+                    f"Head {later_push} was pushed after the merge; it is not recorded as "
+                    "the merged head"
+                )
+                decide = "decide whether the merge and branch state stand"
+            open_escalation(
+                uow,
+                clock,
+                task=task,
+                attempt_id=None,
+                question=f"{summary}. {problem}; {decide}."[:2000],
+                wake_reason=WakeReason.MERGED,
+                summary=summary[:500],
+            )
+            return True
         create_wake(
             uow,
             clock,
@@ -1153,6 +1312,46 @@ def settle_pull_request_state(
         )
         return True
     return False
+
+
+def _wake_closed_during_correction(
+    uow: UnitOfWork, clock: Clock, *, task: Task, pull_request: PullRequest
+) -> None:
+    """hades #379: the pull request was closed unmerged while the task was in a
+    correction state, or a first publication's publish_failed. The close is recorded on
+    the PR, which is not polled again; the task has no edge to `rejected` from here, so
+    Foundry is woken and decides. In publishing the publication finds the close itself
+    and fails with a wake that names it."""
+    if task.state is TaskState.PUBLISHING:
+        return
+    links = {"pull_request": f"/v1/tasks/{task.id}/pull-request"}
+    if task.state is TaskState.PUBLISH_FAILED:
+        # The wake says to reopen and then republish; it carries the way to do so.
+        links["republish"] = f"/v1/tasks/{task.id}/republish"
+    create_wake(
+        uow,
+        clock,
+        principal_id=task.principal_id,
+        reason=WakeReason.PULL_REQUEST_CLOSED,
+        summary=_closed_correction_summary(task, pull_request),
+        task=task,
+        extra_links=links,
+    )
+
+
+def _closed_correction_summary(task: Task, pull_request: PullRequest) -> str:
+    start = (
+        f"pull request #{pull_request.number} was closed without being merged by "
+        f"{pull_request.closed_by or 'someone'} while the task was {task.state.value}; "
+    )
+    if task.state is TaskState.PUBLISH_FAILED:
+        action = f"the task stays there; {reopen_or_cancel(pull_request.number)}"
+    else:
+        action = (
+            "the correction continues, but publication will fail unless the pull request "
+            "is reopened; cancelling the task is the usual answer"
+        )
+    return (start + action)[:500]
 
 
 def evaluate_delivery_gates(
@@ -1804,7 +2003,7 @@ def apply_observation(
     if with_reactions:
         pull_request.last_reactions_polled_at = now
     uow.pull_requests.save(pull_request)
-    if task.state in CORRECTION_STATES:
+    if correction_in_flight(uow, task):
         return _observe_during_correction(
             uow, clock, task=task, pull_request=pull_request, observation=observation
         )
@@ -1931,7 +2130,8 @@ def _observe_during_correction(
 ) -> ObservationResult:
     """hades #360: a poll while a correction runs against the open PR looks for one fact,
     the merge. Comments, checks and the head belong to the corrected head, which the
-    correction publishes; the poll after that takes them in."""
+    correction publishes; the poll after that takes them in. hades #379: and a close,
+    which is recorded so the PR is not polled for ever and Foundry is woken."""
     result = ObservationResult()
     record_event(
         uow,
@@ -1946,7 +2146,7 @@ def _observe_during_correction(
             "during_correction": task.state.value,
         },
     )
-    if observation.pull_request.merged:
+    if observation.pull_request.merged or observation.pull_request.state == "closed":
         observe_state(
             uow,
             clock,

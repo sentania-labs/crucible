@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any, Literal, Protocol
 
 from crucible.domain.endpoints import validate_endpoint
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.github import InstallationToken
 
 # Where the workspace appears inside every Crucible-created container (06, 08).
@@ -105,6 +106,10 @@ class LaunchSpec:
     # FDY-0140: the harness's saved run settings (`harness.<name>`), handed to the
     # adapter's launch as LaunchContext.harness_settings.
     harness_settings: dict[str, Any] = field(default_factory=dict)
+    # Hades #388: the context length, response allowance and thinking setting this
+    # attempt runs with (also in harness_settings), for the supervisor to record on the
+    # attempt. None when the harness reads none of them.
+    effective_settings: dict[str, Any] | None = None
     # An unpublished correction starts from the preceding attempt's sealed bundle.
     # The provider mounts this one file into the preparer; the worker never sees the
     # preceding workspace.
@@ -157,6 +162,9 @@ class Observation:
     # S5: 137 with the kernel's OOM kill is an environment failure, not a crash and not
     # a kill Crucible sent. Carried as a flag so classification never parses `detail`.
     oom_killed: bool = False
+    never_started: bool = False
+    container_message: str | None = None
+    pod_events: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +303,7 @@ class CollectedOutputs:
     # it did not.
     leftover_committed: bool = False
     leftover_note: str | None = None
+    interruption: Interruption | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +477,17 @@ class LaunchRefusedError(ProviderError):
     """A launch the provider refused on purpose (07, 13): the image's harness version is
     outside the adapter's tested range, or the harness has no credential to run with.
     The supervisor turns this into a wake, not a retry."""
+
+
+class WorkerStartError(ProviderError):
+    """Hades #346: the runtime accepted the worker but could not start its process (a
+    mount that is not a directory, an executable not found, an exec format error). The
+    harness never ran, so this is an infrastructure interruption, not an environment
+    failure of the attempt; `observation` carries the runtime's own message."""
+
+    def __init__(self, observation: Observation) -> None:
+        super().__init__(f"the worker never started: {observation.container_message}")
+        self.observation = observation
 
 
 class LaunchCancelledError(ProviderError):

@@ -64,6 +64,57 @@ def load_routing(uow: UnitOfWork, policy_document: dict[str, Any]) -> RoutingPol
     return RoutingPolicyV1.model_validate(record.document)
 
 
+def current_routing_version(uow: UnitOfWork, policy_document: dict[str, Any]) -> int | None:
+    """hades #254: the routing version an attempt routes with now. A pinned reference
+    keeps its version; an unpinned one follows the newest published version of the
+    routing policy it names, so a correction or retry never routes with a model the
+    routing policy has since removed or disabled. The policy snapshot is not changed.
+
+    A version counts as published when it is not retired and some policy references
+    it, as `publish_routing` always writes: a version only uploaded with
+    PUT /routing/{name}/{version} has no egress set for it yet and is never chosen.
+    Only versions newer than the referenced one are considered, so when the referenced
+    version is retired and nothing newer is published the attempt keeps the referenced
+    version rather than falling back to an older one."""
+    ref = routing_ref(policy_document)
+    if ref is None:
+        return None
+    name, version = ref
+    if (policy_document.get("routing") or {}).get("policy", {}).get("pinned") is True:
+        return version
+    newer = sorted(
+        (
+            record.version
+            for record in uow.routing_policies.list_versions(name)
+            if record.version > version and record.retired_at is None
+        ),
+        reverse=True,
+    )
+    return next(
+        (candidate for candidate in newer if uow.routing_policies.is_referenced(name, candidate)),
+        version,
+    )
+
+
+def load_attempt_routing(
+    uow: UnitOfWork, policy_document: dict[str, Any], routing_version: int | None = None
+) -> RoutingPolicyV1 | None:
+    """The routing policy for an attempt: the version recorded on it once it was
+    routed, otherwise the version it would route with now (`current_routing_version`)."""
+    ref = routing_ref(policy_document)
+    if ref is None:
+        return None
+    version = (
+        routing_version
+        if routing_version is not None
+        else current_routing_version(uow, policy_document)
+    )
+    record = uow.routing_policies.get(ref[0], version if version is not None else ref[1])
+    if record is None:
+        return None
+    return RoutingPolicyV1.model_validate(record.document)
+
+
 def check_selection(
     routing: RoutingPolicyV1, *, tier: str, harness: str, model_id: str
 ) -> list[Problem]:
@@ -257,6 +308,7 @@ def select_model(
     harnesses: HarnessRegistry | None = None,
     image_allowlist: list[str] | None = None,
     excluded_pools: set[str] | None = None,
+    excluded_models: set[str] | None = None,
     pinned_model: str | None = None,
     pinned_harness: str | None = None,
 ) -> Selection:
@@ -299,6 +351,8 @@ def select_model(
             reasons.append("pool is at its soft limit")
         if usage.exhausted_until is not None:
             reasons.append(f"pool exhausted until {usage.exhausted_until.isoformat()}")
+        if excluded_models and entry.id in excluded_models:
+            reasons.append("model refused capacity for this retry")
         if excluded_pools and entry.pool in excluded_pools:
             reasons.append("pool excluded for the current quota reroute")
         image = image_for_harness(uow, entry.harness, provider)
@@ -365,6 +419,7 @@ def select_model(
             "image": image or None,
             "eligible": not reasons,
             "excluded": reasons,
+            "capacity_refused": bool(excluded_models and entry.id in excluded_models),
             "preferred_pool": entry.pool in preferred,
             "quality": quality.as_dict(),
         }
@@ -444,11 +499,18 @@ def quality_state(
 
 
 def reserve(
-    uow: UnitOfWork, policy_document: dict[str, Any], *, harness: str, model_id: str, now: datetime
+    uow: UnitOfWork,
+    policy_document: dict[str, Any],
+    *,
+    harness: str,
+    model_id: str,
+    now: datetime,
+    routing_version: int | None = None,
 ) -> Reservation:
     """The authoritative pool check at attempt launch (05b). Called inside the fenced
-    transaction that moves the attempt to `launching`."""
-    routing = load_routing(uow, policy_document)
+    transaction that moves the attempt to `launching`, against the routing version the
+    attempt was routed with (hades #254)."""
+    routing = load_attempt_routing(uow, policy_document, routing_version)
     entry: RoutingModel | None = routing.model(model_id) if routing else None
     if routing is None or entry is None:
         return Reservation(

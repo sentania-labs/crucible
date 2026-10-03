@@ -120,6 +120,7 @@ def test_the_bootstrap_sets_the_turn_budget_only_where_none_was_named(
     (hermes / "run_agent.py").write_text(_STAND_IN_AGENT, encoding="utf-8")
     (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (hermes / "hermes_cli" / "main.py").write_text(_STAND_IN_MAIN, encoding="utf-8")
+    # The bootstrap starts only the Hermes version its patches were written for (#385).
     (hermes / "hermes_agent-0.19.0.dist-info").mkdir()
     (hermes / "hermes_agent-0.19.0.dist-info" / "METADATA").write_text(
         "Metadata-Version: 2.1\nName: hermes-agent\nVersion: 0.19.0\n", encoding="utf-8"

@@ -45,6 +45,9 @@ class AttemptSummary(Response):
     harness: str | None = None
     image: str | None = None
     pool: str | None = None
+    routing_version: int | None = None
+    # hades #388: context_length, max_output_tokens and thinking, as launched.
+    effective_settings: dict[str, Any] | None = None
     reroute_from_attempt_id: str | None = None
     resume_from_remote: bool = False
 
@@ -193,6 +196,8 @@ class AttemptView(Response):
     harness: str | None = None
     image: str | None = None
     pool: str | None = None
+    routing_version: int | None = None
+    effective_settings: dict[str, Any] | None = None
     ordered_candidates: list[dict[str, Any]] = Field(default_factory=list)
     resume_from_remote: bool = False
 

@@ -171,6 +171,11 @@ class Attempt:
     ordered_candidates: list[dict[str, Any]] = field(default_factory=list)
     routing_excluded_pools: list[str] = field(default_factory=list)
     resume_from_remote: bool = False
+    # hades #254: the routing policy version this attempt was routed with.
+    routing_version: int | None = None
+    # hades #388: the context length, response allowance and thinking setting the
+    # harness was launched with, recorded once and reused by every later spec of it.
+    effective_settings: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -254,6 +259,9 @@ class SupervisorStatus:
     last_success_at: datetime | None = None
     last_error_at: datetime | None = None
     last_error: str | None = None
+    # 339: the seq of the last CREDENTIAL_REFRESH_REQUESTED event the renewer has
+    # handled, persisted so a supervisor restart does not replay history as pending.
+    refresh_request_cursor: int | None = None
 
 
 class EscalationState(StrEnum):

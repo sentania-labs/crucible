@@ -24,6 +24,8 @@ from typing import Any
 
 import pytest
 
+from tests.unit.test_issue_385_hermes_search import _FALLBACK_0_19_0
+
 WRAPPER = Path(__file__).resolve().parents[2] / "images" / "worker" / "crucible-hermes.py"
 
 _CODING_CONTEXT = """
@@ -219,6 +221,7 @@ def _stand_in_hermes(base: Path, version: str = "0.19.0") -> Path:
         "agent/verification_stop.py": _VERIFICATION_STOP,
         "tools/__init__.py": "",
         "tools/file_tools.py": _FILE_TOOLS,
+        "tools/file_operations.py": f"class ShellFileOperations:\n{_FALLBACK_0_19_0}",
         "hermes_cli/__init__.py": f'__version__ = "{version}"\n',
         "hermes_cli/main.py": _MAIN,
         f"hermes_agent-{version}.dist-info/METADATA": (
@@ -314,6 +317,29 @@ def test_hermes_refuses_to_start_under_a_release_the_patch_was_not_written_for(
 ) -> None:
     _checkout(tmp_path)
     result = _bootstrap(tmp_path, "writes", version="0.20.0")
-    assert result.returncode == 70
+    assert result.returncode == 1
     assert "hermes-agent 0.19.0, found 0.20.0" in result.stderr
     assert result.stdout == ""
+
+
+def test_the_guard_version_matches_the_image_pin() -> None:
+    pins = (WRAPPER.parent / "Dockerfile").read_text(encoding="utf-8")
+    assert f"ARG HARNESS_HERMES_VERSION={_wrapper().HERMES_VERSION}\n" in pins
+
+
+def test_preflight_rejects_a_changed_guard_before_hermes_starts(tmp_path: Path) -> None:
+    hermes = _stand_in_hermes(tmp_path)
+    guard = hermes / "agent" / "verification_evidence.py"
+    guard.write_text("def mark_workspace_edited(*, session_id, cwd): pass\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-P", "-c", _wrapper().PREFLIGHT + "\nprint('started')"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PYTHONPATH": str(hermes)},
+    )
+    assert result.returncode == 70
+    assert (
+        "agent.verification_evidence.mark_workspace_edited is not the 0.19.0 shape" in result.stderr
+    )
+    assert "started" not in result.stdout

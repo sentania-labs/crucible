@@ -147,6 +147,9 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         "CRUCIBLE_HERMES_IDENTITY": "/crucible/identity/IDENTITY.md",
         "CRUCIBLE_HERMES_MAX_TURNS": "300",
         "CRUCIBLE_HERMES_CONTEXT_LENGTH": "131072",
+        # Hades #388: the gateway's response allowance and the entry's thinking setting.
+        "CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS": "32000",
+        "CRUCIBLE_HERMES_THINKING": "false",
         "OPENAI_BASE_URL": "http://spark.example.internal:11434/v1",
         "OPENAI_API_KEY": "local-no-auth",
         "CRUCIBLE_HERMES_USAGE": "/crucible/report/hermes-usage.json",

@@ -660,6 +660,10 @@ class Attempts:
             ordered_candidates=list(row.ordered_candidates or []),
             routing_excluded_pools=list(row.routing_excluded_pools or []),
             resume_from_remote=bool(row.resume_from_remote),
+            routing_version=row.routing_version,
+            effective_settings=(
+                dict(row.effective_settings) if row.effective_settings is not None else None
+            ),
         )
 
     def add(self, attempt: Attempt) -> None:
@@ -696,6 +700,8 @@ class Attempts:
                 ordered_candidates=list(attempt.ordered_candidates),
                 routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
+                routing_version=attempt.routing_version,
+                effective_settings=attempt.effective_settings,
             )
         )
         self._s.flush()
@@ -737,6 +743,8 @@ class Attempts:
                 ordered_candidates=list(attempt.ordered_candidates),
                 routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
+                routing_version=attempt.routing_version,
+                effective_settings=attempt.effective_settings,
             )
         )
 
@@ -753,6 +761,19 @@ class Attempts:
             select(AttemptRow).where(AttemptRow.task_id == task_id).order_by(AttemptRow.id)
         ).all()
         return [self._to_entity(r) for r in rows]
+
+    def routes_with(self, routing_name: str, routing_version: int) -> bool:
+        """hades #254: whether any attempt recorded this routing policy version."""
+        count = self._s.scalar(
+            select(func.count())
+            .select_from(AttemptRow)
+            .join(ExecutionRow, ExecutionRow.id == AttemptRow.execution_id)
+            .where(
+                AttemptRow.routing_version == routing_version,
+                ExecutionRow.policy_snapshot[("routing", "policy", "name")].astext == routing_name,
+            )
+        )
+        return bool(count)
 
     def list_in_states(
         self, states: Sequence[AttemptState], *, for_update: bool = False
@@ -1338,6 +1359,7 @@ class SupervisorStatuses:
             last_success_at=_dt(row.last_success_at),
             last_error_at=_dt(row.last_error_at),
             last_error=row.last_error,
+            refresh_request_cursor=row.refresh_request_cursor,
         )
 
     def write(self, status: SupervisorStatus) -> None:
@@ -1352,6 +1374,7 @@ class SupervisorStatuses:
         row.last_success_at = status.last_success_at
         row.last_error_at = status.last_error_at
         row.last_error = status.last_error
+        row.refresh_request_cursor = status.refresh_request_cursor
         self._s.flush()
 
 

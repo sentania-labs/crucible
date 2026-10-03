@@ -42,6 +42,12 @@ ROLE_COMPLETION_CLAIM = "completion_claim"
 ROLE_WORKER_CLAIM = "worker_claim"
 ROLE_RUN_EVIDENCE = "run_evidence"
 ROLE_REVIEW_REPORT = "review_report"
+# hades #344: the collector's `git diff <base>...HEAD` for the internal review. Its own
+# role, so a gate that wants the worker's run evidence never counts it, and its own
+# name, outside the worker's `report/` namespace.
+ROLE_REVIEW_DIFF = "review_diff"
+REVIEW_DIFF_NAME = "crucible/diff.patch"
+REVIEW_DIFF_TYPE = "diff"
 
 
 class EvidenceV1(StrictModel):
